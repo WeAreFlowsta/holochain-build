@@ -1,0 +1,247 @@
+diff --git a/crates/holochain_data/src/dht/inner/sync_queries.rs b/crates/holochain_data/src/dht/inner/sync_queries.rs
+index 91b195a..6922f40 100644
+--- a/crates/holochain_data/src/dht/inner/sync_queries.rs
++++ b/crates/holochain_data/src/dht/inner/sync_queries.rs
+@@ -56,7 +56,74 @@ pub struct ArcBounds {
+     pub end: u32,
+ }
+ 
++/// Arcs narrower than this (1/64 of the location space) are read through the
++/// `ChainOp_storage_center_loc_narrow_arc` index. Kitsune2 asks for one DHT
++/// sector (1/512 of the space) at a time, 512 times per update, and without
++/// the index each of those reads scans every action in the store. Wider arcs
++/// and wrapping arcs keep the scan, which is the faster plan for them.
++const NARROW_ARC_WIDTH: u32 = 1 << 26;
++
++/// [`op_hashes_in_time_slice`] for a narrow, non-wrapping arc. Same rows as
++/// the general statement; the chain-op branch starts from the location index.
++const NARROW_ARC_TIME_SLICE_SQL: &str = "
++    SELECT op_hash AS hash, basis_hash, serialized_size, sort_ts FROM (
++        SELECT
++            ChainOp.hash AS op_hash,
++            ChainOp.basis_hash AS basis_hash,
++            ChainOp.serialized_size AS serialized_size,
++            Action.timestamp AS sort_ts
++        FROM ChainOp INDEXED BY ChainOp_storage_center_loc_narrow_arc
++        JOIN Action ON ChainOp.action_hash = Action.hash
++        WHERE
++            ChainOp.storage_center_loc >= ?
++            AND ChainOp.storage_center_loc <= ?
++            AND Action.timestamp >= ?
++            AND Action.timestamp <  ?
++            AND ChainOp.locally_validated = 1
++            AND (ChainOp.op_type != 2 OR Action.private_entry = 0)
++        UNION ALL
++        SELECT
++            Warrant.hash AS op_hash,
++            Warrant.warrantee AS basis_hash,
++            WarrantOp.serialized_size AS serialized_size,
++            Warrant.timestamp AS sort_ts
++        FROM Warrant
++        JOIN WarrantOp ON WarrantOp.hash = Warrant.hash
++        WHERE
++            WarrantOp.storage_center_loc >= ?
++            AND WarrantOp.storage_center_loc <= ?
++            AND Warrant.timestamp >= ?
++            AND Warrant.timestamp <  ?
++    )
++    ORDER BY sort_ts ASC
++";
++
++/// [`earliest_authored_timestamp_in_arc`] for a narrow, non-wrapping arc.
++const NARROW_ARC_EARLIEST_SQL: &str = "
++    SELECT MIN(ts) FROM (
++        SELECT Action.timestamp AS ts
++        FROM ChainOp INDEXED BY ChainOp_storage_center_loc_narrow_arc
++        JOIN Action ON ChainOp.action_hash = Action.hash
++        WHERE
++            ChainOp.storage_center_loc >= ?
++            AND ChainOp.storage_center_loc <= ?
++            AND ChainOp.locally_validated = 1
++            AND (ChainOp.op_type != 2 OR Action.private_entry = 0)
++        UNION ALL
++        SELECT Warrant.timestamp AS ts
++        FROM Warrant
++        JOIN WarrantOp ON WarrantOp.hash = Warrant.hash
++        WHERE
++            WarrantOp.storage_center_loc >= ?
++            AND WarrantOp.storage_center_loc <= ?
++    )
++";
++
+ impl ArcBounds {
++    /// Non-wrapping and narrow enough for the location index to win.
++    fn is_narrow(self) -> bool {
++        self.start <= self.end && self.end - self.start < NARROW_ARC_WIDTH
++    }
+     fn start_i64(self) -> i64 {
+         self.start as i64
+     }
+@@ -80,6 +147,22 @@ pub(crate) async fn op_hashes_in_time_slice<'e, E>(
+ where
+     E: Executor<'e, Database = Sqlite>,
+ {
++    if arc.is_narrow() {
++        return sqlx::query_as::<_, K2OpHashRow>(NARROW_ARC_TIME_SLICE_SQL)
++            // chain-op branch
++            .bind(arc.start_i64())
++            .bind(arc.end_i64())
++            .bind(t_start_micros)
++            .bind(t_end_micros)
++            // warrant branch
++            .bind(arc.start_i64())
++            .bind(arc.end_i64())
++            .bind(t_start_micros)
++            .bind(t_end_micros)
++            .fetch_all(executor)
++            .await;
++    }
++
+     // Two arc-filter shapes: non-wrapping (start <= end) keeps everything
+     // inside the range; wrapping (start > end) keeps everything outside.
+     // We bind the same arc values twice (once per UNION branch).
+@@ -838,6 +921,19 @@ pub(crate) async fn earliest_authored_timestamp_in_arc<'e, E>(
+ where
+     E: Executor<'e, Database = Sqlite>,
+ {
++    if arc.is_narrow() {
++        let row: Option<(Option<i64>,)> = sqlx::query_as(NARROW_ARC_EARLIEST_SQL)
++            // chain-op branch
++            .bind(arc.start_i64())
++            .bind(arc.end_i64())
++            // warrant branch
++            .bind(arc.start_i64())
++            .bind(arc.end_i64())
++            .fetch_optional(executor)
++            .await?;
++        return Ok(row.and_then(|(v,)| v));
++    }
++
+     let sql = "
+         SELECT MIN(ts) FROM (
+             SELECT Action.timestamp AS ts
+@@ -1396,6 +1492,82 @@ mod tests {
+         );
+     }
+ 
++    /// The fixture's ops sit at location 0. A narrow arc around them takes
++    /// the indexed statement and must serve exactly what the full arc serves.
++    #[tokio::test]
++    async fn narrow_arc_time_slice_matches_the_full_arc() {
++        let (db, public, private, record) = seed_filter_fixture().await;
++
++        let read = |start: u32, end: u32| {
++            let db = db.clone();
++            async move {
++                db.as_ref()
++                    .op_hashes_in_time_slice(start, end, 0, i64::MAX)
++                    .await
++                    .unwrap()
++                    .into_iter()
++                    .map(|r| r.hash)
++                    .collect::<Vec<Vec<u8>>>()
++            }
++        };
++
++        let full = read(0, u32::MAX).await;
++        let narrow = read(0, 1000).await;
++        assert_eq!(narrow, full, "same rows, in the same timestamp order");
++        assert_eq!(narrow, vec![public, record]);
++        assert!(!narrow.contains(&private));
++
++        assert!(
++            read(5000, 6000).await.is_empty(),
++            "a narrow arc that holds no op serves nothing"
++        );
++
++        let in_window: Vec<Vec<u8>> = db
++            .as_ref()
++            .op_hashes_in_time_slice(0, 1000, 2500, 3001)
++            .await
++            .unwrap()
++            .into_iter()
++            .map(|r| r.hash)
++            .collect();
++        assert_eq!(in_window.len(), 1, "the time window still applies");
++    }
++
++    #[tokio::test]
++    async fn narrow_arc_earliest_timestamp_matches_the_full_arc() {
++        let (db, _public, _private, _record) = seed_filter_fixture().await;
++
++        let narrow = db
++            .as_ref()
++            .earliest_authored_timestamp_in_arc(0, 1000)
++            .await
++            .unwrap();
++        assert_eq!(narrow, Some(2000));
++
++        let elsewhere = db
++            .as_ref()
++            .earliest_authored_timestamp_in_arc(5000, 6000)
++            .await
++            .unwrap();
++        assert_eq!(elsewhere, None);
++    }
++
++    #[tokio::test]
++    async fn the_narrow_arc_index_exists_and_opening_twice_is_fine() {
++        let db = test_open_db(dht_id()).await.unwrap();
++        crate::ensure_narrow_arc_index(db.pool(), crate::kind::DbKind::Dht)
++            .await
++            .unwrap();
++        let (n,): (i64,) = sqlx::query_as(
++            "SELECT COUNT(*) FROM sqlite_master
++             WHERE type = 'index' AND name = 'ChainOp_storage_center_loc_narrow_arc'",
++        )
++        .fetch_one(db.pool())
++        .await
++        .unwrap();
++        assert_eq!(n, 1);
++    }
++
+     #[tokio::test]
+     async fn ids_since_read_withholds_private_store_entry() {
+         let (db, public, private, record) = seed_filter_fixture().await;
+diff --git a/crates/holochain_data/src/lib.rs b/crates/holochain_data/src/lib.rs
+index 71a0835..be2468d 100644
+--- a/crates/holochain_data/src/lib.rs
++++ b/crates/holochain_data/src/lib.rs
+@@ -166,6 +166,7 @@ pub async fn open_db<I: DatabaseIdentifier>(
+ 
+     // Run migrations for this database kind
+     migrator_for(database_id.db_kind()).run(&pool).await?;
++    ensure_narrow_arc_index(&pool, database_id.db_kind()).await?;
+ 
+     Ok(DbWrite::new(pool, database_id))
+ }
+@@ -176,10 +177,29 @@ pub async fn test_open_db<I: DatabaseIdentifier>(database_id: I) -> sqlx::Result
+ 
+     // Run migrations for this database kind
+     migrator_for(database_id.db_kind()).run(&pool).await?;
++    ensure_narrow_arc_index(&pool, database_id.db_kind()).await?;
+ 
+     Ok(DbWrite::new(pool, database_id))
+ }
+ 
++/// Create the index that the narrow-arc time-slice reads in
++/// `dht::inner::sync_queries` are pinned to.
++///
++/// It is created here and not in a migration, so the set of applied
++/// migrations stays the one a build without this change expects, and such a
++/// build can still open the database (it ignores the extra index).
++async fn ensure_narrow_arc_index(pool: &Pool<Sqlite>, db_kind: kind::DbKind) -> sqlx::Result<()> {
++    if matches!(db_kind, kind::DbKind::Dht) {
++        sqlx::query(
++            "CREATE INDEX IF NOT EXISTS ChainOp_storage_center_loc_narrow_arc
++                ON ChainOp(storage_center_loc)",
++        )
++        .execute(pool)
++        .await?;
++    }
++    Ok(())
++}
++
+ /// Connect to a SQLite database using the provided connection string.
+ async fn connect_database(
+     db_path: &Path,

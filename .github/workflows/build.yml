@@ -1,0 +1,152 @@
+name: Build
+
+# Builds the Holochain conductor from the upstream release tag named in
+# upstream.env, with the patches in patches/<tag>/ applied, the same way
+# upstream builds its own release binaries (holochain/binaries):
+# `cargo build --release --package holochain --bin holochain`.
+#
+# Run by hand for a test build (artifacts only), or push a tag
+# `<upstream tag>-flowsta.<n>` to publish a release with checksums.
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Which platforms to build"
+        type: choice
+        default: linux
+        options:
+          - linux
+          - all
+  push:
+    tags:
+      - "holochain-*-flowsta.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          PLATFORMS: ${{ github.event_name == 'push' && 'all' || inputs.platforms }}
+        run: |
+          linux='{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","ext":""}'
+          rest='{"os":"macos-latest","target":"aarch64-apple-darwin","ext":""},{"os":"macos-15-intel","target":"x86_64-apple-darwin","ext":""},{"os":"windows-2022","target":"x86_64-pc-windows-msvc","ext":".exe"}'
+          if [ "$PLATFORMS" = "all" ]; then m="[$linux,$rest]"; else m="[$linux]"; fi
+          echo "matrix={\"include\":$m}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    name: holochain on ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read the upstream release
+        run: grep -E '^[A-Z_]+=' upstream.env >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+        with:
+          repository: holochain/holochain
+          ref: ${{ env.HOLOCHAIN_COMMIT }}
+          path: holochain
+
+      - name: Check the upstream commit
+        run: |
+          got=$(git -C holochain rev-parse HEAD)
+          [ "$got" = "$HOLOCHAIN_COMMIT" ] || { echo "checked out $got, expected $HOLOCHAIN_COMMIT"; exit 1; }
+          host=$(rustc -vV | sed -n 's|host: ||p')
+          [ "$host" = "${{ matrix.target }}" ] || { echo "this runner builds $host, expected ${{ matrix.target }}"; exit 1; }
+
+      - name: Apply the patches
+        run: |
+          shopt -s nullglob
+          patches=(patches/"$HOLOCHAIN_TAG"/*.patch)
+          [ "${#patches[@]}" -gt 0 ] || { echo "no patches for $HOLOCHAIN_TAG"; exit 1; }
+          for p in "${patches[@]}"; do
+            git -C holochain apply --check "../$p"
+            git -C holochain apply "../$p"
+            echo "applied $p"
+          done
+          git -C holochain status --short
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: holochain
+
+      # The patched crate's own tests, old and new, once per build set.
+      - name: Test the patched crate
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: |
+          cd holochain
+          cargo test --package holochain_data --features test-utils,encryption
+
+      - name: Build
+        run: |
+          cd holochain
+          cargo build --release --package holochain --bin holochain
+
+      - name: Collect
+        run: |
+          mkdir deploy
+          asset="holochain-${{ matrix.target }}${{ matrix.ext }}"
+          cp "holochain/target/release/holochain${{ matrix.ext }}" "deploy/$asset"
+          cd deploy
+          if command -v sha256sum >/dev/null; then sha256sum "$asset"; else shasum -a 256 "$asset"; fi | tee "$asset.sha256"
+          ./"$asset" --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: holochain-${{ matrix.target }}
+          path: deploy/*
+          if-no-files-found: error
+
+  release:
+    if: ${{ github.event_name == 'push' }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: deploy
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          grep -E '^[A-Z_]+=' upstream.env > /tmp/upstream.env && . /tmp/upstream.env
+          case "$GITHUB_REF_NAME" in "$HOLOCHAIN_TAG"-flowsta.*) ;; *) echo "tag $GITHUB_REF_NAME does not match upstream.env ($HOLOCHAIN_TAG)"; exit 1 ;; esac
+          cd deploy
+          cat ./*.sha256 > SHA256SUMS.txt && rm ./*.sha256
+          sha256sum --check SHA256SUMS.txt
+          {
+            echo "Holochain \`$HOLOCHAIN_TAG\` (commit \`$HOLOCHAIN_COMMIT\`) with the patches in \`patches/$HOLOCHAIN_TAG/\` at this tag."
+            echo
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } > ../notes.md
+          gh release create "$GITHUB_REF_NAME" ./* --title "$GITHUB_REF_NAME" --notes-file ../notes.md
