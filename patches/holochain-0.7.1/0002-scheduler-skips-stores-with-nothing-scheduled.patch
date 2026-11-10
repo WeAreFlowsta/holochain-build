@@ -1,5 +1,5 @@
 diff --git a/crates/holochain/src/conductor/cell.rs b/crates/holochain/src/conductor/cell.rs
-index f5bef2a..f4c9ecf 100644
+index f5bef2a..126258c 100644
 --- a/crates/holochain/src/conductor/cell.rs
 +++ b/crates/holochain/src/conductor/cell.rs
 @@ -218,6 +218,18 @@ impl Cell {
@@ -9,7 +9,7 @@ index f5bef2a..f4c9ecf 100644
 +    /// Whether this cell's DNA has any scheduled function, for any agent.
 +    /// An error counts as "yes", so the tick runs as it always did.
 +    pub(super) async fn any_scheduled_fns_in_dna(&self) -> bool {
-+        match self.space.dht_store.any_scheduled_functions().await {
++        match self.space.dht_store.as_read().any_scheduled_functions().await {
 +            Ok(any) => any,
 +            Err(e) => {
 +                error!("error checking for scheduled fns: {:?}", e);
