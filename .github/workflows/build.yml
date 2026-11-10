@@ -104,7 +104,7 @@ jobs:
       # On Windows the build runs in PowerShell, as upstream's does: Git Bash puts its own
       # perl first on the PATH, and OpenSSL's source build needs the runner's full perl.
       - name: Build
-        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
+        shell: ${{ matrix.ext == '.exe' && 'pwsh' || 'bash' }}
         run: |
           cd holochain
           cargo build --release --package holochain --bin holochain
