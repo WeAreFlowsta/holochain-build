@@ -1,0 +1,57 @@
+diff --git a/crates/holochain/src/core/queue_consumer/publish_dht_ops_consumer.rs b/crates/holochain/src/core/queue_consumer/publish_dht_ops_consumer.rs
+index b0e8095..27e9952 100644
+--- a/crates/holochain/src/core/queue_consumer/publish_dht_ops_consumer.rs
++++ b/crates/holochain/src/core/queue_consumer/publish_dht_ops_consumer.rs
+@@ -46,6 +46,7 @@ pub fn spawn_publish_dht_ops_consumer(
+             let tx = tx.clone();
+             let dht_store = dht_store.clone();
+             let agent = cell_id.agent_pubkey().clone();
++            let cell_id = cell_id.clone();
+             let network = network.clone();
+             let min_publish_interval = conductor
+                 .get_config()
+@@ -57,9 +58,44 @@ pub fn spawn_publish_dht_ops_consumer(
+                     return Ok(WorkComplete::Complete);
+                 }
+ 
++                // With no remote peer in the space there is nobody to publish
++                // to: every publish would fail with `NoPeersForLocation`, no op
++                // would be marked as published, and each commit would list and
++                // retry every op the agent has authored. Keep the loop running,
++                // so the ops are published once a peer is there.
++                if !any_remote_peer(&conductor, &cell_id).await {
++                    tx.resume_loop();
++                    return Ok(WorkComplete::Complete);
++                }
++
+                 publish_dht_ops_workflow(dht_store, network, tx, agent, min_publish_interval).await
+             }
+         },
+     );
+     sender
+ }
++
++/// Whether the peer store of the cell's space holds a reachable agent that is
++/// not one of this conductor's own cells. When the store cannot be read the
++/// answer is yes, and the publish workflow decides.
++async fn any_remote_peer(conductor: &ConductorHandle, cell_id: &CellId) -> bool {
++    let Ok(peer_store) = conductor
++        .holochain_p2p()
++        .peer_store(cell_id.dna_hash().clone())
++        .await
++    else {
++        return true;
++    };
++    let Ok(agents) = peer_store.get_all().await else {
++        return true;
++    };
++    let local: std::collections::HashSet<_> = conductor
++        .running_cell_ids()
++        .into_iter()
++        .filter(|id| id.dna_hash() == cell_id.dna_hash())
++        .map(|id| id.agent_pubkey().to_k2_agent())
++        .collect();
++    agents
++        .iter()
++        .any(|a| !a.is_tombstone && a.url.is_some() && !local.contains(&a.agent))
++}
