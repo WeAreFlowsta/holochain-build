@@ -1,0 +1,36 @@
+diff --git a/crates/holochain_data/src/dht/inner/cap_grant.rs b/crates/holochain_data/src/dht/inner/cap_grant.rs
+index e0a273d..00288fe 100644
+--- a/crates/holochain_data/src/dht/inner/cap_grant.rs
++++ b/crates/holochain_data/src/dht/inner/cap_grant.rs
+@@ -22,6 +22,13 @@ where
+     Ok(())
+ }
+ 
++// In both reads below `CROSS JOIN` fixes the join order (SQLite never
++// reorders one): the few `CapGrant` rows are read first and each looks up its
++// action by hash. With a plain `JOIN` the planner walks every action of the
++// author in `seq` order and probes `CapGrant` for each, so a read that runs
++// on every zome call costs time in proportion to the chain's length. The rows
++// returned are the same.
++
+ pub(crate) async fn get_cap_grants_by_access<'e, E>(
+     executor: E,
+     author: AgentPubKey,
+@@ -33,7 +40,7 @@ where
+     sqlx::query_as(
+         "SELECT cg.action_hash, cg.cap_access, cg.tag
+          FROM CapGrant cg
+-         JOIN Action ON cg.action_hash = Action.hash
++         CROSS JOIN Action ON cg.action_hash = Action.hash
+          WHERE cg.cap_access = ? AND Action.author = ?
+          ORDER BY Action.seq",
+     )
+@@ -54,7 +61,7 @@ where
+     sqlx::query_as(
+         "SELECT cg.action_hash, cg.cap_access, cg.tag
+          FROM CapGrant cg
+-         JOIN Action ON cg.action_hash = Action.hash
++         CROSS JOIN Action ON cg.action_hash = Action.hash
+          WHERE cg.tag = ? AND Action.author = ?
+          ORDER BY Action.seq",
+     )
