@@ -1,0 +1,63 @@
+name: Upstream tests
+
+# Runs upstream's own tests for the areas the patches touch, on the patched
+# source: every test of holochain_data and holochain_state, and the conductor's
+# tests of scheduling, publishing, zome init and capability grants.
+# Run by hand before a release tag.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read the upstream release
+        run: grep -E '^[A-Z_]+=' upstream.env >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+        with:
+          repository: holochain/holochain
+          ref: ${{ env.HOLOCHAIN_COMMIT }}
+          path: holochain
+
+      - name: Apply the patches
+        run: |
+          for p in patches/"$HOLOCHAIN_TAG"/*.patch; do
+            git -C holochain apply "../$p"
+            echo "applied $p"
+          done
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: holochain
+          key: upstream-tests
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: The wasm target for upstream's test zomes
+        run: cd holochain && rustup target add wasm32-unknown-unknown
+
+      - name: holochain_data
+        run: cd holochain && cargo test --package holochain_data --features test-utils,encryption
+
+      - name: holochain_state
+        run: cd holochain && cargo nextest run --package holochain_state --locked --features test_utils,encryption --no-fail-fast
+
+      - name: The conductor's tests of the patched areas
+        run: |
+          cd holochain
+          RUST_BACKTRACE=1 cargo nextest run --package holochain --locked --no-default-features \
+            --features slow_tests,build_wasms,encryption,wasmer-sys-cranelift --no-fail-fast \
+            -E 'test(schedul) | test(publish) | test(init) | test(cap_grant) | test(capabilit) | test(grant) | test(source_chain) | test(zome_call)'
