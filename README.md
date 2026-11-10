@@ -8,7 +8,7 @@ It holds no copy of Holochain's source. Each build checks out the upstream tag a
 
 | Upstream release | Commit | Patches |
 |---|---|---|
-| `holochain-0.7.1` | `fdaa678786cd5618c36a7290aad69a5f1511d8a9` | 1 |
+| `holochain-0.7.1` | `fdaa678786cd5618c36a7290aad69a5f1511d8a9` |2 |
 
 Only the conductor (`holochain`) is built here. The key store (`lair-keystore`) is used as upstream ships it.
 
@@ -39,6 +39,14 @@ The patch:
 The statements return the same rows. Rows with equal timestamps may come back in a different order; 0.7.1 does not define that order, and Kitsune2 combines the hashes with XOR, which does not depend on it.
 
 Files changed: `crates/holochain_data/src/lib.rs`, `crates/holochain_data/src/dht/inner/sync_queries.rs` (with tests).
+
+### 0002: the scheduler tick reads before it deletes
+
+The conductor's scheduler runs every 100 ms. On each tick, for every cell, it deletes that agent's ephemeral scheduled functions that have started (`DELETE FROM ScheduledFunction WHERE ephemeral = 1 AND author = ? AND start_at <= ?`), whether or not there are any. A delete takes the database's write lock even when it removes nothing, and it measured about 1 ms each: with 20 cells and nothing scheduled, that is 11 seconds of database time every minute, and it is most of an idle conductor's CPU.
+
+The patch asks first, with a read, whether there is a row the delete would remove (`SELECT EXISTS` with the same condition, about 0.07 ms), and runs the delete only when there is. The delete itself is unchanged, so a cell that does schedule functions behaves as before.
+
+Files changed: `crates/holochain_data/src/dht/db_operations/scheduled_function.rs`, `crates/holochain_data/src/dht/inner/scheduled_function.rs` (with a test).
 
 ## Building
 
