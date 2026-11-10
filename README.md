@@ -8,7 +8,7 @@ It holds no copy of Holochain's source. Each build checks out the upstream tag a
 
 | Upstream release | Commit | Patches |
 |---|---|---|
-| `holochain-0.7.1` | `fdaa678786cd5618c36a7290aad69a5f1511d8a9` |2 |
+| `holochain-0.7.1` | `fdaa678786cd5618c36a7290aad69a5f1511d8a9` | 5 |
 
 Only the conductor (`holochain`) is built here. The key store (`lair-keystore`) is used as upstream ships it.
 
@@ -48,7 +48,46 @@ The patch asks each DHT store once per tick whether the table holds any row at a
 
 Files changed: `crates/holochain/src/conductor/conductor.rs`, `crates/holochain/src/conductor/cell.rs`, `crates/holochain_state/src/dht_store/reads.rs`, `crates/holochain_data/src/dht/db_operations/scheduled_function.rs`, `crates/holochain_data/src/dht/inner/scheduled_function.rs` (with a test).
 
+### 0003: publish waits for a remote peer
+
+In 0.7.1 a publish that finds no peer to send to is an error, and the ops stay unpublished so that they go out as soon as a peer appears (holochain/holochain#5919). On a conductor with no remote peer at all, which is how an app runs for a person with one device, that means no op is ever marked as published: every commit starts a publish round that lists every op the agent has authored and tries each one again, and so does the publish loop every one to five minutes.
+
+The patch checks, before a publish round, whether the space's peer store holds any reachable agent that is not one of this conductor's own cells. If there is none, the round is skipped and the loop keeps running, so the ops are published within one to five minutes of a peer appearing. With any remote peer present, nothing changes. If the peer store cannot be read, the round runs as before.
+
+Files changed: `crates/holochain/src/core/queue_consumer/publish_dht_ops_consumer.rs`.
+
+### 0004: the init check does not read the chain
+
+Before every zome call the conductor checks whether the zomes' `init` has run. In 0.7.1 that check reads and decodes every action of the agent's source chain and then looks for an `InitZomesComplete` among them, so each call, reads included, costs time in proportion to the chain's length (holochain/holochain#6060, where a fuller fix is proposed upstream).
+
+The patch first asks the database whether the agent's committed chain holds an `InitZomesComplete` action (`SELECT EXISTS … WHERE author = ? AND record_validity = ? AND action_type = ?`, which the `Action(author, seq)` index answers from the start of the chain). Only when there is none, on a chain that has not run `init` yet, does the 0.7.1 check run, unchanged.
+
+Files changed: `crates/holochain_state/src/source_chain.rs`, `crates/holochain_state/src/dht_store/reads.rs`, `crates/holochain_data/src/dht/db_operations/action.rs`, `crates/holochain_data/src/dht/inner/action.rs`, `crates/holochain_data/src/dht.rs` (a test).
+
+### 0005: capability grant reads start from the grants
+
+Each zome call looks up the caller's capability grants with a join of `CapGrant` and `Action`. SQLite runs that join by walking every action of the author and probing `CapGrant` for each, so this read also grows with the chain.
+
+The patch writes the join as `CROSS JOIN`, which in SQLite fixes the join order: the few grant rows are read first and each looks up its action by hash. The rows returned and their order are the same.
+
+Files changed: `crates/holochain_data/src/dht/inner/cap_grant.rs`.
+
+### What 0003 to 0005 measure together
+
+One agent with no peers writing 8,000 entries, each with one link (Linux x86_64, encrypted databases):
+
+| | All 8,000 | The first 1,000 | The last 1,000 |
+|---|---|---|---|
+| Patches 0001 and 0002 | 1,763 s | 61 s | 405 s |
+| with 0003 | 1,331 s | 67 s | 300 s |
+| with 0003 and 0004 | 528 s | 46 s | 84 s |
+| with 0003, 0004 and 0005 | 549 s | 78 s | 65 s |
+
+With all five the time per thousand no longer grows with the chain (61 to 78 s throughout; the runs were made on a desktop in use, so totals vary by run). Time spent in database statements for the same number of writes, early in the run against late: 10.6 s against 63.3 s with 0003, and 2.9 s against 3.8 s with all five.
+
 ## Building
+
+The `Upstream tests` workflow, run by hand before a release tag, runs upstream's own tests of `holochain_data` and `holochain_state` and the conductor's tests of the patched areas on the patched source.
 
 Run the `Build` workflow by hand for a test build: it uploads the binary and its SHA-256 as workflow artifacts. Pushing a tag named `<upstream tag>-flowsta.<n>` (for example `holochain-0.7.1-flowsta.1`) builds every platform and publishes a release with `SHA256SUMS.txt`.
 
