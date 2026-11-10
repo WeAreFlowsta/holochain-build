@@ -7,6 +7,15 @@ name: Upstream tests
 
 on:
   workflow_dispatch:
+    inputs:
+      repeat:
+        description: "Run only this one conductor test, ten times with no retries (to tell a flaky test from a broken one)"
+        type: string
+        default: ""
+      leave_out:
+        description: "A patch number to leave out (for example 0003), to compare"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -28,8 +37,11 @@ jobs:
           path: holochain
 
       - name: Apply the patches
+        env:
+          LEAVE_OUT: ${{ inputs.leave_out }}
         run: |
           for p in patches/"$HOLOCHAIN_TAG"/*.patch; do
+            if [ -n "$LEAVE_OUT" ] && [[ "$(basename "$p")" == "$LEAVE_OUT"* ]]; then echo "left out $p"; continue; fi
             git -C holochain apply "../$p"
             echo "applied $p"
           done
@@ -50,12 +62,29 @@ jobs:
         run: cd holochain && rustup target add wasm32-unknown-unknown
 
       - name: holochain_data
+        if: ${{ inputs.repeat == '' }}
         run: cd holochain && cargo test --package holochain_data --features test-utils,encryption
 
       - name: holochain_state
+        if: ${{ inputs.repeat == '' }}
         run: cd holochain && cargo nextest run --package holochain_state --locked --features test_utils,encryption --no-fail-fast
 
+      - name: One conductor test, ten times
+        if: ${{ inputs.repeat != '' }}
+        env:
+          REPEAT: ${{ inputs.repeat }}
+        run: |
+          cd holochain
+          failed=0
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo nextest run --package holochain --locked --no-default-features \
+              --features slow_tests,build_wasms,encryption,wasmer-sys-cranelift --retries 0 \
+              -E "test($REPEAT)" > run.log 2>&1; then echo "run $i: pass $(grep -o 'PASS \[[^]]*\]' run.log | head -1)"; else echo "run $i: FAIL"; failed=$((failed+1)); fi
+          done
+          echo "$failed of 10 failed"
+
       - name: The conductor's tests of the patched areas
+        if: ${{ inputs.repeat == '' }}
         run: |
           cd holochain
           RUST_BACKTRACE=1 cargo nextest run --package holochain --locked --no-default-features \
