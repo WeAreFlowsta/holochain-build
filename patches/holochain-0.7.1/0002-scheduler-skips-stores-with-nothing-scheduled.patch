@@ -1,0 +1,145 @@
+diff --git a/crates/holochain/src/conductor/cell.rs b/crates/holochain/src/conductor/cell.rs
+index f5bef2a..f4c9ecf 100644
+--- a/crates/holochain/src/conductor/cell.rs
++++ b/crates/holochain/src/conductor/cell.rs
+@@ -218,6 +218,18 @@ impl Cell {
+         &self.holochain_p2p_cell
+     }
+ 
++    /// Whether this cell's DNA has any scheduled function, for any agent.
++    /// An error counts as "yes", so the tick runs as it always did.
++    pub(super) async fn any_scheduled_fns_in_dna(&self) -> bool {
++        match self.space.dht_store.any_scheduled_functions().await {
++            Ok(any) => any,
++            Err(e) => {
++                error!("error checking for scheduled fns: {:?}", e);
++                true
++            }
++        }
++    }
++
+     pub(super) async fn dispatch_scheduled_fns(self: Arc<Self>, now: Timestamp) {
+         let author = self.id.agent_pubkey().clone();
+         self.space
+diff --git a/crates/holochain/src/conductor/conductor.rs b/crates/holochain/src/conductor/conductor.rs
+index 5c0b795..8c4cb9e 100755
+--- a/crates/holochain/src/conductor/conductor.rs
++++ b/crates/holochain/src/conductor/conductor.rs
+@@ -2755,11 +2755,25 @@ mod scheduler_impls {
+ 
+         /// The scheduler wants to dispatch any functions that are due.
+         pub(crate) async fn dispatch_scheduled_fns(self: Arc<Self>, now: Timestamp) {
++            // A tick costs each cell three statements. Cells of one DNA share a
++            // store, so ask each store once whether it has any scheduled function
++            // and leave out the cells of a store that has none.
+             let cell_arcs = {
+                 let mut cell_arcs = vec![];
++                let mut dna_has_scheduled_fns: HashMap<DnaHash, bool> = HashMap::new();
+                 for cell_id in self.running_cell_ids() {
+                     if let Ok(cell_arc) = self.cell_by_id(&cell_id).await {
+-                        cell_arcs.push(cell_arc);
++                        let any = match dna_has_scheduled_fns.get(cell_id.dna_hash()) {
++                            Some(any) => *any,
++                            None => {
++                                let any = cell_arc.any_scheduled_fns_in_dna().await;
++                                dna_has_scheduled_fns.insert(cell_id.dna_hash().clone(), any);
++                                any
++                            }
++                        };
++                        if any {
++                            cell_arcs.push(cell_arc);
++                        }
+                     }
+                 }
+                 cell_arcs
+diff --git a/crates/holochain_data/src/dht/db_operations/scheduled_function.rs b/crates/holochain_data/src/dht/db_operations/scheduled_function.rs
+index 05683d7..7964558 100644
+--- a/crates/holochain_data/src/dht/db_operations/scheduled_function.rs
++++ b/crates/holochain_data/src/dht/db_operations/scheduled_function.rs
+@@ -31,6 +31,12 @@ impl DbRead<Dht> {
+         scheduled_function::get_live_scheduled_functions(&mut *conn, author, now).await
+     }
+ 
++    /// Return `true` if the store holds any scheduled-function row, for any author.
++    pub async fn any_scheduled_functions(&self) -> sqlx::Result<bool> {
++        let mut conn = self.timed_conn().await?;
++        scheduled_function::any_scheduled_functions(&mut *conn).await
++    }
++
+     /// Return `true` if a scheduled-function row exists for the given
+     /// `(author, zome_name, scheduled_fn)` tuple, regardless of liveness.
+     pub async fn is_function_scheduled(
+diff --git a/crates/holochain_data/src/dht/inner/scheduled_function.rs b/crates/holochain_data/src/dht/inner/scheduled_function.rs
+index 479c08c..06a4f55 100644
+--- a/crates/holochain_data/src/dht/inner/scheduled_function.rs
++++ b/crates/holochain_data/src/dht/inner/scheduled_function.rs
+@@ -178,6 +178,18 @@ where
+     Ok(result.rows_affected())
+ }
+ 
++/// Return `true` if the store holds any scheduled-function row at all, for any
++/// author. The scheduler asks this once per tick before it visits each cell.
++pub(crate) async fn any_scheduled_functions<'e, E>(executor: E) -> sqlx::Result<bool>
++where
++    E: Executor<'e, Database = Sqlite>,
++{
++    let row: (i64,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM ScheduledFunction)")
++        .fetch_one(executor)
++        .await?;
++    Ok(row.0 != 0)
++}
++
+ /// Delete every ephemeral scheduled-function row in the store, regardless of
+ /// author or liveness. Returns the number of rows deleted.
+ ///
+@@ -421,4 +433,32 @@ mod tests {
+         .await
+         .unwrap();
+     }
++
++    #[tokio::test]
++    async fn any_scheduled_functions_sees_every_kind_of_row() {
++        let payload = b"x";
++        for ephemeral in [true, false] {
++            let db = test_open_db(dht_id()).await.unwrap();
++            assert!(!db.as_ref().any_scheduled_functions().await.unwrap());
++
++            // A row that is not live yet still counts.
++            db.upsert_scheduled_function(InsertScheduledFunction {
++                author: &agent(1),
++                zome_name: "z",
++                scheduled_fn: "f",
++                maybe_schedule: payload,
++                start_at: Timestamp::from_micros(1_000),
++                end_at: Timestamp::from_micros(2_000),
++                ephemeral,
++            })
++            .await
++            .unwrap();
++            assert!(db.as_ref().any_scheduled_functions().await.unwrap());
++
++            db.delete_scheduled_function(&agent(1), "z", "f")
++                .await
++                .unwrap();
++            assert!(!db.as_ref().any_scheduled_functions().await.unwrap());
++        }
++    }
+ }
+diff --git a/crates/holochain_state/src/dht_store/reads.rs b/crates/holochain_state/src/dht_store/reads.rs
+index 5b964a1..cb24d0b 100644
+--- a/crates/holochain_state/src/dht_store/reads.rs
++++ b/crates/holochain_state/src/dht_store/reads.rs
+@@ -55,6 +55,13 @@ impl DhtStore<DbRead<Dht>> {
+         Ok(self.db().get_used_size().await?)
+     }
+ 
++    /// Returns `true` if this store holds any scheduled-function row, for any
++    /// author. When it holds none, a scheduler tick has nothing to do for any
++    /// cell of this DNA.
++    pub async fn any_scheduled_functions(&self) -> StateQueryResult<bool> {
++        Ok(self.db().any_scheduled_functions().await?)
++    }
++
+     /// Returns `true` if a scheduled-function row exists for `author` and
+     /// `scheduled_fn`, regardless of liveness — i.e. whether the current time
+     /// falls within the row's `[start_at, end_at]` window.

@@ -40,13 +40,13 @@ The statements return the same rows. Rows with equal timestamps may come back in
 
 Files changed: `crates/holochain_data/src/lib.rs`, `crates/holochain_data/src/dht/inner/sync_queries.rs` (with tests).
 
-### 0002: the scheduler tick reads before it deletes
+### 0002: the scheduler skips a store with nothing scheduled
 
-The conductor's scheduler runs every 100 ms. On each tick, for every cell, it deletes that agent's ephemeral scheduled functions that have started (`DELETE FROM ScheduledFunction WHERE ephemeral = 1 AND author = ? AND start_at <= ?`), whether or not there are any. A delete takes the database's write lock even when it removes nothing, and it measured about 1 ms each: with 20 cells and nothing scheduled, that is 11 seconds of database time every minute, and it is most of an idle conductor's CPU.
+The conductor's scheduler runs every 100 ms. On each tick, for every running cell, it runs three statements against the `ScheduledFunction` table (expired persisted functions, live functions, and a delete of started ephemeral ones), whether or not anything is scheduled. With 20 cells that is 600 statements a second, and an idle conductor spends 16 to 19 % of a core on them.
 
-The patch asks first, with a read, whether there is a row the delete would remove (`SELECT EXISTS` with the same condition, about 0.07 ms), and runs the delete only when there is. The delete itself is unchanged, so a cell that does schedule functions behaves as before.
+The patch asks each DHT store once per tick whether the table holds any row at all (`SELECT EXISTS (SELECT 1 FROM ScheduledFunction)`). Cells of one DNA share a store, so the cells of a store with no rows are left out of that tick; all three statements find nothing on an empty table, so nothing else changes. A store that has any scheduled function, for any agent, is handled exactly as before. If the check fails, the tick runs as before.
 
-Files changed: `crates/holochain_data/src/dht/db_operations/scheduled_function.rs`, `crates/holochain_data/src/dht/inner/scheduled_function.rs` (with a test).
+Files changed: `crates/holochain/src/conductor/conductor.rs`, `crates/holochain/src/conductor/cell.rs`, `crates/holochain_state/src/dht_store/reads.rs`, `crates/holochain_data/src/dht/db_operations/scheduled_function.rs`, `crates/holochain_data/src/dht/inner/scheduled_function.rs` (with a test).
 
 ## Building
 
