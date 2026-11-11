@@ -56,13 +56,16 @@ The patch checks, before a publish round, whether the space's peer store holds a
 
 Files changed: `crates/holochain/src/core/queue_consumer/publish_dht_ops_consumer.rs`.
 
-### 0004: the init check does not read the chain
+### 0004: chain queries filter in SQL, and the init check is remembered
 
-Before every zome call the conductor checks whether the zomes' `init` has run. In 0.7.1 that check reads and decodes every action of the agent's source chain and then looks for an `InitZomesComplete` among them, so each call, reads included, costs time in proportion to the chain's length (holochain/holochain#6060, where a fuller fix is proposed upstream).
+In 0.7.1 every source chain query reads and decodes every action of the agent's chain and only then applies its filter. Two things run such a query all the time: the check, before every zome call, of whether the zomes' `init` has run; and the HDK's `query` host function, whatever filter a zome gives it. Each therefore costs time in proportion to the chain's length (holochain/holochain#6060).
 
-The patch first asks the database whether the agent's committed chain holds an `InitZomesComplete` action (`SELECT EXISTS … WHERE author = ? AND record_validity = ? AND action_type = ?`, which the `Action(author, seq)` index answers from the start of the chain). Only when there is none, on a chain that has not run `init` yet, does the 0.7.1 check run, unchanged.
+This patch is the fix proposed there, taken from [lightningrodlabs/holochain@ff9cf800c](https://github.com/lightningrodlabs/holochain/commit/ff9cf800c76aebe1c84b6ec40dab6c8bc0bc78bf) by Eric Harris-Braun, without its changelog line and with one import hunk adjusted to the 0.7.1 release:
 
-Files changed: `crates/holochain_state/src/source_chain.rs`, `crates/holochain_state/src/dht_store/reads.rs`, `crates/holochain_data/src/dht/db_operations/action.rs`, `crates/holochain_data/src/dht/inner/action.rs`, `crates/holochain_data/src/dht.rs` (a test).
+- a query's action types and sequence range are applied in SQL, so it reads only the rows that can match; the in-memory filter still has the last word, so results are unchanged;
+- a cell remembers that `init` has completed, so later zome calls do not ask.
+
+Files changed: `crates/holochain/src/conductor/cell.rs`, `crates/holochain_state/src/source_chain.rs`, `crates/holochain_state/src/dht_store/reads.rs`, `crates/holochain_data/src/dht/db_operations/action.rs`, `crates/holochain_data/src/dht/inner/action.rs`, `crates/holochain_data/src/dht.rs` (with upstream's tests).
 
 ### 0005: capability grant reads start from the grants
 
