@@ -1,0 +1,81 @@
+diff --git a/crates/holochain_data/src/dht/db_operations/sync_queries.rs b/crates/holochain_data/src/dht/db_operations/sync_queries.rs
+index b102ea2..c31c35a 100644
+--- a/crates/holochain_data/src/dht/db_operations/sync_queries.rs
++++ b/crates/holochain_data/src/dht/db_operations/sync_queries.rs
+@@ -11,6 +11,10 @@ use crate::models::dht::{
+ use holo_hash::AnyLinkableHash;
+ use holo_hash::{AgentPubKey, DhtOpHash};
+ 
++/// Op hashes per [`DbRead::check_op_hashes_present`] statement: three bound
++/// values each, under SQLite's limit of 32,766 per statement.
++const PRESENT_CHECK_CHUNK: usize = 10_000;
++
+ impl DbRead<Dht> {
+     /// `(hash, basis, size)` for every integrated, locally-validated op
+     /// whose authored timestamp falls in `[t_start_micros, t_end_micros)`.
+@@ -58,12 +62,22 @@ impl DbRead<Dht> {
+ 
+     /// Subset of `op_hashes` we hold in limbo or as locally-validated
+     /// integrated ops (cache-only copies excluded), with their basis hashes.
++    ///
++    /// The statement binds every hash three times, and SQLite takes at most
++    /// 32,766 bound values in one statement, so a longer list is checked in
++    /// chunks: a gossip round may offer far more than 10,922 op ids (one
++    /// agent's activity in a busy time slice is a single batch), and a
++    /// failed check drops the whole exchange.
+     pub async fn check_op_hashes_present(
+         &self,
+         op_hashes: &[Vec<u8>],
+     ) -> sqlx::Result<Vec<K2OpPresentRow>> {
+         let mut conn = self.timed_conn().await?;
+-        sync_queries::check_op_hashes_present(&mut *conn, op_hashes).await
++        let mut present = Vec::new();
++        for chunk in op_hashes.chunks(PRESENT_CHECK_CHUNK) {
++            present.extend(sync_queries::check_op_hashes_present(&mut *conn, chunk).await?);
++        }
++        Ok(present)
+     }
+ 
+     /// Full chain-op rows (joined with `Action` and optional `Entry`) for
+diff --git a/crates/holochain_data/src/dht/inner/sync_queries.rs b/crates/holochain_data/src/dht/inner/sync_queries.rs
+index 6922f40..2c3b56e 100644
+--- a/crates/holochain_data/src/dht/inner/sync_queries.rs
++++ b/crates/holochain_data/src/dht/inner/sync_queries.rs
+@@ -1492,6 +1492,37 @@ mod tests {
+         );
+     }
+ 
++    /// A list longer than one statement can bind (three values per hash,
++    /// 32,766 at most) is still checked: the ops held come back, the rest
++    /// do not, and nothing fails.
++    #[tokio::test]
++    async fn presence_check_takes_more_hashes_than_one_statement_binds() {
++        let (db, public, _private, record) = seed_filter_fixture().await;
++
++        let mut asked: Vec<Vec<u8>> = (0..30_000u32)
++            .map(|i| {
++                let mut h = vec![0xEEu8; 36];
++                h[..4].copy_from_slice(&i.to_be_bytes());
++                h
++            })
++            .collect();
++        asked.insert(7, public.clone());
++        asked.push(record.clone());
++
++        let mut held: Vec<Vec<u8>> = db
++            .as_ref()
++            .check_op_hashes_present(&asked)
++            .await
++            .expect("a long list is checked in chunks")
++            .into_iter()
++            .map(|r| r.hash)
++            .collect();
++        held.sort();
++        let mut expected = vec![public, record];
++        expected.sort();
++        assert_eq!(held, expected);
++    }
++
+     /// The fixture's ops sit at location 0. A narrow arc around them takes
+     /// the indexed statement and must serve exactly what the full arc serves.
+     #[tokio::test]

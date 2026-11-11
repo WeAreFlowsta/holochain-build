@@ -8,7 +8,7 @@ It holds no copy of Holochain's source. Each build checks out the upstream tag a
 
 | Upstream release | Commit | Patches |
 |---|---|---|
-| `holochain-0.7.1` | `fdaa678786cd5618c36a7290aad69a5f1511d8a9` | 5 |
+| `holochain-0.7.1` | `fdaa678786cd5618c36a7290aad69a5f1511d8a9` | 6 |
 
 Only the conductor (`holochain`) is built here. The key store (`lair-keystore`) is used as upstream ships it.
 
@@ -74,6 +74,16 @@ Each zome call looks up the caller's capability grants with a join of `CapGrant`
 The patch writes the join as `CROSS JOIN`, which in SQLite fixes the join order: the few grant rows are read first and each looks up its action by hash. The rows returned and their order are the same.
 
 Files changed: `crates/holochain_data/src/dht/inner/cap_grant.rs`.
+
+### 0006: the presence check takes any number of op ids
+
+Before fetching the ops a peer offers, a conductor asks its database which of them it already holds (`check_op_hashes_present`). The statement binds every op id three times, and the bundled SQLite takes at most 32,766 bound values in one statement, so an offer of more than 10,922 ids fails with "too many SQL variables" and the whole gossip exchange is dropped (holochain/holochain#6062).
+
+The usual way around that is to cap what one exchange may offer (`maxGossipOpBytes`). But Kitsune2 sends the ops of one sector and time slice as one batch, and skips a batch that does not fit the cap; a batch larger than the cap is then never sent. One agent's activity ops all sit in one sector, so an agent that writes a few thousand actions in one time slice makes such a batch, and a second device of the same person never receives that history.
+
+The patch runs the check in chunks of 10,000 ids, so an exchange of any size is answered and the cap is no longer needed. The rows returned are the same.
+
+Files changed: `crates/holochain_data/src/dht/db_operations/sync_queries.rs`, `crates/holochain_data/src/dht/inner/sync_queries.rs` (a test).
 
 ### What 0003 to 0005 measure together
 
