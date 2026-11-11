@@ -79,9 +79,16 @@ Files changed: `crates/holochain_data/src/dht/inner/cap_grant.rs`.
 
 Before fetching the ops a peer offers, a conductor asks its database which of them it already holds (`check_op_hashes_present`). The statement binds every op id three times, and the bundled SQLite takes at most 32,766 bound values in one statement, so an offer of more than 10,922 ids fails with "too many SQL variables" and the whole gossip exchange is dropped (holochain/holochain#6062).
 
-The usual way around that is to cap what one exchange may offer (`maxGossipOpBytes`). But Kitsune2 sends the ops of one sector and time slice as one batch, and skips a batch that does not fit the cap; a batch larger than the cap is then never sent. One agent's activity ops all sit in one sector, so an agent that writes a few thousand actions in one time slice makes such a batch, and a second device of the same person never receives that history.
+The usual way around that is to cap what one exchange may offer (`maxGossipOpBytes`). But Kitsune2's comparison of DHT sectors sends the ops of one sector and time slice as one batch, and skips a batch that does not fit the cap, the same way every round; a batch larger than the cap is never sent by it. One agent's activity ops all sit in one sector, so an agent that writes a few thousand actions in one time slice makes such a batch. Those ops then travel only by the "new ops since the bookmark" exchange, and a restart of the receiving conductor moves that bookmark past them.
 
-The patch runs the check in chunks of 10,000 ids, so an exchange of any size is answered and the cap is no longer needed. The rows returned are the same.
+Measured with two conductors, one holding 82,000 ops written in fourteen minutes and one joining empty:
+
+| | 1 MiB cap, 0.7.1 | no cap, this patch |
+|---|---|---|
+| Receiver left alone | about 1,660 ops a minute (43,176 after 35 minutes) | |
+| Receiver restarted during the sync | 44,381 ops and 489 in validation limbo, unchanged while 45 more rounds completed; neither side claimed a storage arc | all 82,006 integrated 10 minutes after joining, with two restarts in the first four |
+
+The patch runs the check in chunks of 10,000 ids, so an exchange of any size is answered and the cap can go (Kitsune2's default of 100 MB an exchange then applies). The rows returned are the same. A conductor without the patch must keep its cap.
 
 Files changed: `crates/holochain_data/src/dht/db_operations/sync_queries.rs`, `crates/holochain_data/src/dht/inner/sync_queries.rs` (a test).
 
